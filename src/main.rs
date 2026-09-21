@@ -37,8 +37,8 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([780.0, 860.0])
-            .with_min_inner_size([460.0, 580.0])
+            .with_inner_size([450.0, 780.0])
+            .with_min_inner_size([380.0, 560.0])
             .with_title("三角洲行动 · 自动钓鱼")
             .with_decorations(false)
             .with_transparent(true)
@@ -88,11 +88,13 @@ impl App {
         let upd = updater::UpdaterHandle::default();
         upd.check_async();
 
+        let studio_state = studio::StudioState::default();
+
         Self {
             shared,
             updater: upd,
             current_tab: MainTab::Fishing,
-            studio: studio::StudioState::default(),
+            studio: studio_state,
             pinned: true,
             pin_initialized: false,
             show_settings: false,
@@ -503,8 +505,10 @@ impl eframe::App for App {
                         .fill(bg_f)
                         .stroke(egui::Stroke::new(1.0, if fishing_active { theme::MINT } else { theme::LINE }))
                         .corner_radius(egui::CornerRadius::same(7));
-                    if ui.add(btn_f).clicked() {
+                    if ui.add(btn_f).clicked() && self.current_tab != MainTab::Fishing {
                         self.current_tab = MainTab::Fishing;
+                        // 自动切换为钓鱼紧凑窄屏悬浮窗模式 (450 x 780)
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(450.0, 780.0)));
                     }
 
                     let (bg_s, fg_s) = if studio_active {
@@ -516,8 +520,11 @@ impl eframe::App for App {
                         .fill(bg_s)
                         .stroke(egui::Stroke::new(1.0, if studio_active { theme::CYAN } else { theme::LINE }))
                         .corner_radius(egui::CornerRadius::same(7));
-                    if ui.add(btn_s).clicked() {
+                    if ui.add(btn_s).clicked() && self.current_tab != MainTab::Studio {
                         self.current_tab = MainTab::Studio;
+                        // 自动切换为声学工坊宽屏大图模式 (860 x 840)
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(860.0, 840.0)));
+                        self.studio.refresh_available_recordings();
                     }
                 });
                 ui.add_space(4.0);

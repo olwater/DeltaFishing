@@ -1,4 +1,4 @@
-//! 声学标定工坊：长音频录制、多轮钓鱼切片、双端点区间标注、自动预标注与换饵排查系统。
+//! 声学标定工坊：长音频录制、多录音档案库、多轮钓鱼切片、双端点区间标注与换饵时序标定。
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -18,7 +18,6 @@ pub enum FishingMode {
 }
 
 impl FishingMode {
-    #[allow(dead_code)]
     pub fn label(&self) -> &'static str {
         match self {
             FishingMode::Float => "台钓模式",
@@ -72,7 +71,7 @@ impl EventType {
             EventType::Fight => Color32::from_rgb(0xa8, 0x55, 0xf7),
             EventType::Catch => Color32::from_rgb(0x34, 0xd3, 0x99),
             EventType::Miss | EventType::Snag => theme::RED,
-            EventType::Rebait => Color32::from_rgb(0xfb, 0x92, 0x3c), // 亮橙
+            EventType::Rebait => Color32::from_rgb(0xfb, 0x92, 0x3c), // 亮橙色
             EventType::CastFailed => Color32::from_rgb(0xf4, 0x3f, 0x5e), // 警示红
             EventType::Noise => theme::AMBER,
             EventType::Custom(_) => Color32::from_rgb(0x94, 0xa3, 0xb8),
@@ -125,12 +124,39 @@ impl AudioSlice {
     }
 }
 
+/// 单次录音会话元数据（与 session_*.wav 配对保存为 session_*.json）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMetadata {
+    pub session_id: String,
+    pub mode: FishingMode,
+    pub wav_file: String,
+    pub sample_rate: u32,
+    #[allow(dead_code)]
+    pub duration_sec: f32,
+    pub markers: Vec<EventMarker>,
+    pub slices: Vec<AudioSlice>,
+}
+
+/// 历史录音档案条目（用于列表显示与切换）。
+#[derive(Debug, Clone)]
+pub struct SessionEntry {
+    pub filename: String,
+    pub wav_path: PathBuf,
+    #[allow(dead_code)]
+    pub json_path: PathBuf,
+    pub timestamp_display: String,
+    #[allow(dead_code)]
+    pub duration_sec: f32,
+    pub marker_count: usize,
+    pub mode: FishingMode,
+}
+
 /// 内存音频录制与波形缓存。
 #[derive(Clone, Default)]
 pub struct AudioRecording {
-    #[allow(dead_code)]
     pub file_path: Option<PathBuf>,
     pub sample_rate: u32,
+    #[allow(dead_code)]
     pub duration_sec: f32,
     pub frames: Vec<StereoFrame>,
     pub peaks: Vec<(f32, f32)>,
@@ -160,6 +186,41 @@ impl AudioRecording {
             frames,
             peaks,
         }
+    }
+
+    pub fn from_wav_file(path: &Path) -> Result<Self, String> {
+        let bytes = std::fs::read(path).map_err(|e| format!("读取文件失败: {e}"))?;
+        let mut reader = hound::WavReader::new(std::io::Cursor::new(bytes))
+            .map_err(|e| format!("解析 WAV 失败: {e}"))?;
+        let spec = reader.spec();
+        let sr = spec.sample_rate;
+        let channels = spec.channels as usize;
+
+        let raw_samples: Vec<f32> = match spec.sample_format {
+            hound::SampleFormat::Float => reader.samples::<f32>().filter_map(|s| s.ok()).collect(),
+            hound::SampleFormat::Int => match spec.bits_per_sample {
+                16 => reader.samples::<i16>().filter_map(|s| s.ok()).map(|s| s as f32 / 32768.0).collect(),
+                24 => reader.samples::<i32>().filter_map(|s| s.ok()).map(|s| s as f32 / 8_388_608.0).collect(),
+                _ => reader.samples::<i32>().filter_map(|s| s.ok()).map(|s| s as f32 / 2_147_483_648.0).collect(),
+            },
+        };
+
+        let mut frames = Vec::with_capacity(raw_samples.len() / channels.max(1));
+        if channels <= 1 {
+            for &s in &raw_samples {
+                frames.push(StereoFrame::new(s, s));
+            }
+        } else {
+            for chunk in raw_samples.chunks(channels) {
+                let l = chunk[0];
+                let r = if chunk.len() > 1 { chunk[1] } else { l };
+                frames.push(StereoFrame::new(l, r));
+            }
+        }
+
+        let mut rec = Self::from_frames(frames, sr);
+        rec.file_path = Some(path.to_path_buf());
+        Ok(rec)
     }
 
     pub fn save_to_wav(&self, path: &Path) -> Result<(), String> {
@@ -241,6 +302,20 @@ pub fn play_sound_raw(_bytes: &[u8]) {}
 #[cfg(not(windows))]
 pub fn stop_sound_raw() {}
 
+/// 打开系统资源管理器文件夹。
+pub fn open_folder(dir: &Path) {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("explorer.exe")
+            .arg(dir.as_os_str())
+            .spawn();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = dir;
+    }
+}
+
 /// 仿真评测报告。
 #[derive(Debug, Clone, Default)]
 pub struct SimReport {
@@ -254,6 +329,7 @@ pub struct SimReport {
     pub recommended_level_min: f32,
     pub recommended_pan_max: f32,
 }
+
 /// 声学工坊全局状态。
 pub struct StudioState {
     pub mode: FishingMode,
@@ -261,6 +337,7 @@ pub struct StudioState {
     pub record_start: Option<Instant>,
     pub live_buffer: Arc<Mutex<Vec<StereoFrame>>>,
     pub current_recording: Option<AudioRecording>,
+    pub current_session_id: String,
     pub markers: Vec<EventMarker>,
     pub next_marker_id: u64,
     /// 选中的标记 ID
@@ -271,6 +348,8 @@ pub struct StudioState {
     pub slices: Vec<AudioSlice>,
     pub next_slice_id: u64,
     pub active_slice_id: Option<u64>,
+    /// 历史录音档案库
+    pub available_sessions: Vec<SessionEntry>,
     /// 时间线游标位置（秒）
     pub cursor_sec: f32,
     /// 选区起始点与结束点
@@ -292,12 +371,13 @@ pub struct StudioState {
 
 impl Default for StudioState {
     fn default() -> Self {
-        Self {
+        let mut s = Self {
             mode: FishingMode::Float,
             recording: false,
             record_start: None,
             live_buffer: Arc::new(Mutex::new(Vec::new())),
             current_recording: None,
+            current_session_id: String::new(),
             markers: Vec::new(),
             next_marker_id: 1,
             selected_marker_id: None,
@@ -305,6 +385,7 @@ impl Default for StudioState {
             slices: Vec::new(),
             next_slice_id: 1,
             active_slice_id: None,
+            available_sessions: Vec::new(),
             cursor_sec: 0.0,
             selection_start_sec: None,
             selection_end_sec: None,
@@ -318,7 +399,9 @@ impl Default for StudioState {
             loop_playback: false,
             sim_report: None,
             status_msg: "就绪。按 [Space 空格] 播放/暂停，按 [← / →] 微调游标，按 [1-6] 快速打标。".into(),
-        }
+        };
+        s.refresh_available_recordings();
+        s
     }
 }
 
@@ -330,7 +413,152 @@ impl StudioState {
         base.join("DeltaFishing").join("dataset")
     }
 
-    /// 启动时间线音频播放（从当前游标或选区）。
+    /// 刷新历史录音档案库。
+    pub fn refresh_available_recordings(&mut self) {
+        let dir = Self::dataset_dir();
+        if !dir.exists() {
+            let _ = std::fs::create_dir_all(&dir);
+        }
+
+        let mut entries = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for entry in rd.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("wav") {
+                    let fname = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    let json_path = path.with_extension("json");
+
+                    // 尝试读取元数据
+                    let mut dur = 0.0f32;
+                    let mut cnt = 0usize;
+                    let mut mode = FishingMode::Float;
+
+                    if let Ok(text) = std::fs::read_to_string(&json_path) {
+                        if let Ok(meta) = serde_json::from_str::<SessionMetadata>(&text) {
+                            dur = meta.duration_sec;
+                            cnt = meta.markers.len();
+                            mode = meta.mode;
+                        }
+                    } else if let Ok(rec) = AudioRecording::from_wav_file(&path) {
+                        dur = rec.duration_sec;
+                    }
+
+                    // 格式化时间戳
+                    let ts_display = if fname.starts_with("session_") && fname.len() >= 23 {
+                        let y = &fname[8..12];
+                        let m = &fname[12..14];
+                        let d = &fname[14..16];
+                        let hh = &fname[17..19];
+                        let mm = &fname[19..21];
+                        format!("{y}-{m}-{d} {hh}:{mm}")
+                    } else {
+                        fname.clone()
+                    };
+
+                    entries.push(SessionEntry {
+                        filename: fname,
+                        wav_path: path,
+                        json_path,
+                        timestamp_display: ts_display,
+                        duration_sec: dur,
+                        marker_count: cnt,
+                        mode,
+                    });
+                }
+            }
+        }
+
+        // 按文件名降序（最新在上）
+        entries.sort_by(|a, b| b.filename.cmp(&a.filename));
+        self.available_sessions = entries;
+
+        // 如果当前没有载入且存在录音，自动载入最新的那条
+        if self.current_recording.is_none() && !self.available_sessions.is_empty() {
+            let latest_path = self.available_sessions[0].wav_path.clone();
+            self.load_session(&latest_path);
+        }
+    }
+
+    /// 载入指定的历史录音与标记。
+    pub fn load_session(&mut self, wav_path: &Path) {
+        self.stop_playback();
+        match AudioRecording::from_wav_file(wav_path) {
+            Ok(rec) => {
+                let json_path = wav_path.with_extension("json");
+                let mut markers = Vec::new();
+                let mut slices = Vec::new();
+                let mut mode = self.mode;
+                let fname = wav_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+
+                if let Ok(text) = std::fs::read_to_string(&json_path) {
+                    if let Ok(meta) = serde_json::from_str::<SessionMetadata>(&text) {
+                        markers = meta.markers;
+                        slices = meta.slices;
+                        mode = meta.mode;
+                    }
+                }
+
+                let max_id = markers.iter().map(|m| m.id).max().unwrap_or(0);
+                self.next_marker_id = max_id + 1;
+                let max_sl_id = slices.iter().map(|s| s.id).max().unwrap_or(0);
+                self.next_slice_id = max_sl_id + 1;
+
+                let dur = rec.duration_sec;
+                self.current_recording = Some(rec);
+                self.current_session_id = fname.clone();
+                self.mode = mode;
+                self.markers = markers;
+                self.slices = slices;
+                self.active_slice_id = None;
+                self.selected_marker_id = None;
+                self.cursor_sec = 0.0;
+                self.view_start_sec = 0.0;
+                self.view_duration_sec = dur.min(45.0).max(10.0);
+                self.status_msg = format!("已载入历史录音：{fname}（时长 {:.1}s · {}个标记）", dur, self.markers.len());
+
+                // 若暂无切片，自动分切
+                if self.slices.is_empty() {
+                    self.auto_slice_rounds();
+                }
+            }
+            Err(e) => {
+                self.status_msg = format!("载入录音失败: {e}");
+            }
+        }
+    }
+
+    /// 将当前会话元数据（标记与切片）保存至配套的 JSON 文件中。
+    pub fn save_current_session(&self) {
+        if let Some(rec) = &self.current_recording {
+            if let Some(wav_path) = &rec.file_path {
+                let json_path = wav_path.with_extension("json");
+                let meta = SessionMetadata {
+                    session_id: self.current_session_id.clone(),
+                    mode: self.mode,
+                    wav_file: wav_path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                    sample_rate: rec.sample_rate,
+                    duration_sec: rec.duration_sec,
+                    markers: self.markers.clone(),
+                    slices: self.slices.clone(),
+                };
+                if let Ok(text) = serde_json::to_string_pretty(&meta) {
+                    let _ = std::fs::write(json_path, text);
+                }
+            }
+        }
+    }
+
+    /// 删除指定会话。
+    pub fn delete_session(&mut self, wav_path: &Path) {
+        self.stop_playback();
+        let _ = std::fs::remove_file(wav_path);
+        let _ = std::fs::remove_file(wav_path.with_extension("json"));
+        self.current_recording = None;
+        self.markers.clear();
+        self.slices.clear();
+        self.refresh_available_recordings();
+    }
+
     pub fn start_playback(&mut self) {
         let rec = match &self.current_recording {
             Some(r) if !r.frames.is_empty() => r,
@@ -359,7 +587,6 @@ impl StudioState {
         }
     }
 
-    /// 暂停/停止时间线播放。
     pub fn stop_playback(&mut self) {
         stop_sound_raw();
         self.is_playing = false;
@@ -367,7 +594,6 @@ impl StudioState {
         self.playing_audio_bytes = None;
     }
 
-    /// 切换播放/暂停（空格键响应）。
     pub fn toggle_playback(&mut self) {
         if self.is_playing {
             self.stop_playback();
@@ -438,6 +664,7 @@ impl StudioState {
         let _ = recording.save_to_wav(&wav_path);
 
         self.current_recording = Some(recording);
+        self.current_session_id = wav_name.clone();
         self.cursor_sec = 0.0;
         self.view_start_sec = 0.0;
         self.view_duration_sec = elapsed.min(45.0).max(10.0);
@@ -449,6 +676,8 @@ impl StudioState {
 
         self.auto_prelabel();
         self.auto_slice_rounds();
+        self.save_current_session();
+        self.refresh_available_recordings();
 
         self.status_msg = format!("录音完成（时长 {:.1}s），已切出 {} 轮钓鱼切片，按 [空格键] 可试听播放！", elapsed, self.slices.len());
         Ok(())
@@ -507,6 +736,7 @@ impl StudioState {
 
         self.slices = slices;
         self.next_slice_id = self.slices.len() as u64 + 1;
+        self.save_current_session();
     }
 
     pub fn slice_current_selection(&mut self) {
@@ -527,6 +757,7 @@ impl StudioState {
                 });
                 self.active_slice_id = Some(id);
                 self.status_msg = format!("已将选区切片保存为独立切片片段（时长 {:.1}s）！", e - s);
+                self.save_current_session();
             }
         }
     }
@@ -612,6 +843,7 @@ impl StudioState {
 
         self.markers = auto_markers;
         self.markers.sort_by(|a, b| a.start_sec.partial_cmp(&b.start_sec).unwrap());
+        self.save_current_session();
     }
 
     pub fn add_or_update_interval_marker(&mut self, event_type: EventType) {
@@ -650,27 +882,7 @@ impl StudioState {
         self.selection_start_sec = None;
         self.selection_end_sec = None;
         self.markers.sort_by(|a, b| a.start_sec.partial_cmp(&b.start_sec).unwrap());
-    }
-
-    pub fn preview_selection_or_cursor(&self) {
-        if let Some(rec) = &self.current_recording {
-            let (start, dur) = if let Some(mid) = self.selected_marker_id {
-                if let Some(m) = self.markers.iter().find(|m| m.id == mid) {
-                    (m.start_sec, m.duration())
-                } else {
-                    (self.cursor_sec, 1.5)
-                }
-            } else {
-                match (self.selection_start_sec, self.selection_end_sec) {
-                    (Some(a), Some(b)) if (b - a).abs() >= 0.05 => (a.min(b), (b - a).abs()),
-                    _ => (self.cursor_sec, 1.5),
-                }
-            };
-            if let Ok(wav_bytes) = rec.slice_to_wav_bytes(start, dur) {
-                let arc_bytes = Arc::new(wav_bytes);
-                play_sound_raw(&arc_bytes);
-            }
-        }
+        self.save_current_session();
     }
 
     pub fn export_marker_as_template(&mut self, marker_id: u64) -> Result<PathBuf, String> {
@@ -776,6 +988,7 @@ impl StudioState {
         self.sim_report = Some(report);
     }
 }
+
 /// 渲染波形时间线画布，支持播放时游标平滑走动与手柄拖拽微调。
 pub fn render_timeline(ui: &mut egui::Ui, state: &mut StudioState) {
     if state.current_recording.is_none() {
@@ -816,7 +1029,7 @@ pub fn render_timeline(ui: &mut egui::Ui, state: &mut StudioState) {
     }
 
     let rec = state.current_recording.as_ref().unwrap();
-let total_dur = rec.duration_sec.max(1.0);
+    let total_dur = rec.duration_sec.max(1.0);
     let view_start = state.view_start_sec.clamp(0.0, total_dur);
     let view_dur = state.view_duration_sec.clamp(2.0, total_dur);
     let view_end = (view_start + view_dur).min(total_dur);
@@ -1004,6 +1217,7 @@ let total_dur = rec.duration_sec.max(1.0);
     } else if response.drag_stopped() {
         state.drag_handle = DragHandle::None;
         state.markers.sort_by(|a, b| a.start_sec.partial_cmp(&b.start_sec).unwrap());
+        state.save_current_session();
     } else if response.clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
             let t = to_time(pos.x);
@@ -1031,7 +1245,8 @@ let total_dur = rec.duration_sec.max(1.0);
         painter.add(egui::Shape::convex_polygon(vec![pt1, pt2, pt3], theme::MINT, egui::Stroke::NONE));
     }
 }
-/// 渲染声学标定工坊主面板（包含多轮切片、媒体播放器、双排打标、快捷键与选中控制台）。
+
+/// 渲染声学标定工坊主面板（包含多录音档案库、多轮切片、媒体播放器、双排打标、快捷键与选中控制台）。
 pub fn render_studio_panel(
     ui: &mut egui::Ui,
     state: &mut StudioState,
@@ -1045,12 +1260,10 @@ pub fn render_studio_panel(
     // 全局基础快捷键监听（空格播放、方向键微移、数字键打标）
     // ==========================================
     if !ui.ctx().egui_wants_keyboard_input() {
-        // 1. 空格键：播放 / 暂停
         if ui.input(|i| i.key_pressed(egui::Key::Space)) {
             state.toggle_playback();
         }
 
-        // 2. 左右方向键：微调时间线游标
         let shift = ui.input(|i| i.modifiers.shift);
         let step = if shift { 0.50 } else { 0.05 };
         if ui.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
@@ -1065,7 +1278,6 @@ pub fn render_studio_panel(
             state.selection_end_sec = None;
         }
 
-        // 3. 数字键 1-6 快速打标
         if ui.input(|i| i.key_pressed(egui::Key::Num1)) {
             state.add_or_update_interval_marker(EventType::Cast);
         }
@@ -1090,15 +1302,14 @@ pub fn render_studio_panel(
             state.add_or_update_interval_marker(EventType::Noise);
         }
 
-        // 4. Delete / Backspace：删除选中的标记
         if ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
             if let Some(sel_id) = state.selected_marker_id {
                 state.markers.retain(|m| m.id != sel_id);
                 state.selected_marker_id = None;
+                state.save_current_session();
             }
         }
 
-        // 5. Escape：取消选区和选中状态
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             state.selected_marker_id = None;
             state.selection_start_sec = None;
@@ -1124,10 +1335,12 @@ pub fn render_studio_panel(
                                 let float_active = state.mode == FishingMode::Float;
                                 if ui.selectable_label(float_active, egui::RichText::new("台钓模式").size(12.5).strong()).clicked() {
                                     state.mode = FishingMode::Float;
+                                    state.save_current_session();
                                 }
                                 let lure_active = state.mode == FishingMode::Lure;
                                 if ui.selectable_label(lure_active, egui::RichText::new("路亚模式").size(12.5).strong()).clicked() {
                                     state.mode = FishingMode::Lure;
+                                    state.save_current_session();
                                 }
 
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1170,7 +1383,59 @@ pub fn render_studio_panel(
 
                     ui.add_space(8.0);
 
-                    // ---- 2. 长录音钓鱼轮次切片栏 ----
+                    // ---- 2. 历史录音档案库选择栏 (多录音管理) ----
+                    egui::Frame::new()
+                        .fill(theme::CARD)
+                        .stroke(egui::Stroke::new(1.0, theme::LINE))
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .inner_margin(egui::Margin::symmetric(12, 8))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("📂 录音档案库:").size(12.0).color(theme::TEXT_DIM));
+
+                                let current_title = if state.current_session_id.is_empty() {
+                                    "（暂未选择录音）".to_string()
+                                } else {
+                                    format!("当前: {} ({:.1}s)", state.current_session_id, rec_dur.unwrap_or(0.0))
+                                };
+
+                                let mut to_load = None;
+                                egui::ComboBox::from_id_salt("history-recordings-combo")
+                                    .width(280.0)
+                                    .selected_text(current_title)
+                                    .show_ui(ui, |ui| {
+                                        for entry in &state.available_sessions {
+                                            let is_sel = state.current_session_id == entry.filename;
+                                            let item_text = format!("{} ({} · {}个标记)", entry.timestamp_display, entry.mode.label(), entry.marker_count);
+                                            if ui.selectable_label(is_sel, item_text).clicked() {
+                                                to_load = Some(entry.wav_path.clone());
+                                            }
+                                        }
+                                    });
+
+                                if let Some(p) = to_load {
+                                    state.load_session(&p);
+                                }
+
+                                if ui.small_button("📂 打开目录").on_hover_text("在资源管理器中查看录音与标注文件").clicked() {
+                                    open_folder(&StudioState::dataset_dir());
+                                }
+                                if ui.small_button("🔄 刷新").clicked() {
+                                    state.refresh_available_recordings();
+                                }
+                                if let Some(rec) = &state.current_recording {
+                                    if let Some(p) = rec.file_path.clone() {
+                                        if ui.small_button("🗑 删除当前").clicked() {
+                                            state.delete_session(&p);
+                                        }
+                                    }
+                                }
+                            });
+                        });
+
+                    ui.add_space(8.0);
+
+                    // ---- 3. 长录音钓鱼轮次切片栏 ----
                     if let Some(total_dur) = rec_dur {
                         egui::Frame::new()
                             .fill(theme::CARD)
@@ -1212,7 +1477,7 @@ pub fn render_studio_panel(
                         ui.add_space(6.0);
                     }
 
-                    // ---- 3. 媒体播放控制工具栏 (Transport Bar) ----
+                    // ---- 4. 媒体播放控制工具栏 (Transport Bar) ----
                     if let Some(total_dur) = rec_dur {
                         egui::Frame::new()
                             .fill(theme::CARD)
@@ -1253,10 +1518,10 @@ pub fn render_studio_panel(
                         ui.add_space(4.0);
                     }
 
-                    // ---- 4. 波形时间线画布 ----
+                    // ---- 5. 波形时间线画布 ----
                     render_timeline(ui, state);
 
-                    // ---- 5. 视口缩放与平移微调条 (修复浮点长小数显示) ----
+                    // ---- 6. 视口缩放与平移微调条 ----
                     if let Some(total_dur) = rec_dur {
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
@@ -1278,7 +1543,8 @@ pub fn render_studio_panel(
                     }
 
                     ui.add_space(10.0);
-                    // ---- 6. 当前选中标记专属控制卡 ----
+
+                    // ---- 7. 当前选中标记专属控制卡 ----
                     let mut insp_delete = false;
                     let mut insp_preview = false;
                     let mut insp_export = false;
@@ -1343,10 +1609,11 @@ pub fn render_studio_panel(
                         if let Some(sel_id) = state.selected_marker_id {
                             state.markers.retain(|m| m.id != sel_id);
                             state.selected_marker_id = None;
+                            state.save_current_session();
                         }
                     }
                     if insp_preview {
-                        state.preview_selection_or_cursor();
+                        state.start_playback();
                     }
                     if insp_export {
                         if let Some(sel_id) = state.selected_marker_id {
@@ -1354,7 +1621,7 @@ pub fn render_studio_panel(
                         }
                     }
 
-                    // ---- 7. 双排区间打标工具栏 ----
+                    // ---- 8. 双排区间打标工具栏 ----
                     egui::Frame::new()
                         .fill(theme::CARD)
                         .stroke(egui::Stroke::new(1.0, theme::LINE))
@@ -1420,7 +1687,7 @@ pub fn render_studio_panel(
 
                             ui.add_space(6.0);
 
-                            // 第二排：换饵/上饵与抛竿失败异常
+                            // 第二排：换饵与异常排查
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(egui::RichText::new("换饵异常:").size(12.0).strong().color(Color32::from_rgb(0xfb, 0x92, 0x3c)));
 
@@ -1458,7 +1725,7 @@ pub fn render_studio_panel(
 
                     ui.add_space(8.0);
 
-                    // ---- 8. 双端点标记区间列表 ----
+                    // ---- 9. 双端点标记区间列表 ----
                     egui::Frame::new()
                         .fill(theme::CARD)
                         .stroke(egui::Stroke::new(1.0, theme::LINE))
@@ -1471,6 +1738,7 @@ pub fn render_studio_panel(
                                     if !state.markers.is_empty() && ui.small_button("清空所有标记").clicked() {
                                         state.markers.clear();
                                         state.selected_marker_id = None;
+                                        state.save_current_session();
                                     }
                                     if state.current_recording.is_some() && ui.button(egui::RichText::new("🔍 全切片联合仿真跑分").size(12.0).color(theme::CYAN)).clicked() {
                                         state.run_simulation(cfg);
@@ -1548,6 +1816,7 @@ pub fn render_studio_panel(
                                     if state.selected_marker_id == Some(id) {
                                         state.selected_marker_id = None;
                                     }
+                                    state.save_current_session();
                                 }
                                 if let Some(id) = to_export {
                                     let _ = state.export_marker_as_template(id);
@@ -1585,7 +1854,7 @@ pub fn render_studio_panel(
 
                     ui.add_space(8.0);
 
-                    // ---- 9. 底部快捷键操作指南与状态栏 ----
+                    // ---- 10. 底部快捷键指南栏 ----
                     egui::Frame::new()
                         .fill(Color32::from_black_alpha(60))
                         .stroke(egui::Stroke::new(1.0, theme::LINE))
@@ -1602,3 +1871,4 @@ pub fn render_studio_panel(
                 });
         });
 }
+
