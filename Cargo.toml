@@ -1,6 +1,6 @@
 [package]
 name = "deltafishing"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.97"
 description = "三角洲行动 · 自动钓鱼（鼠标左键 + 声音回环检测）"
@@ -16,6 +16,7 @@ serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 fastrand = "2"
 raw-window-handle = "0.6"
+ureq = { version = "3.4.2", features = ["json"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

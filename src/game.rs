@@ -73,6 +73,7 @@ pub fn is_game_in_foreground(game_exe: &str) -> bool {
 /// 按进程名前缀查找游戏顶层窗口（后台模式点击的目标）。
 /// 匹配规则与 `is_game_in_foreground` 一致（前 12 字符、不区分大小写）。
 #[cfg(windows)]
+#[allow(dead_code)]
 pub fn find_game_window(game_exe: &str) -> Option<isize> {
     let needle: Vec<char> = game_exe
         .chars()
@@ -164,6 +165,7 @@ pub fn is_game_in_foreground(_game_exe: &str) -> bool {
 }
 
 #[cfg(not(windows))]
+#[allow(dead_code)]
 pub fn find_game_window(_game_exe: &str) -> Option<isize> {
     None
 }

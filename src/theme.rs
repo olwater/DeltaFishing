@@ -1,26 +1,33 @@
-//! 深色玻璃拟态主题（配色取自 DeltaMelody 的 Windows 界面）。
-//!
-//! 映射关系：mint #bcf79b / cyan #9eecdc / amber #f3c77b / blue #99d6ff，
-//! 玻璃背景为半透明深绿，配合 Windows 亚克力(DWM) 透出系统模糊。
+//! 深色玻璃拟态与战术科技主题。
+//! 配色方案：现代黑曜石深色背景，搭配战术薄荷绿、青空蓝、琥珀黄与珊瑚红。
 
 use egui::{Color32, FontFamily, FontId, Stroke, TextStyle};
 
-pub const MINT: Color32 = Color32::from_rgb(0xbc, 0xf7, 0x9b);
-pub const CYAN: Color32 = Color32::from_rgb(0x9e, 0xec, 0xdc);
-pub const AMBER: Color32 = Color32::from_rgb(0xf3, 0xc7, 0x7b);
-pub const BLUE: Color32 = Color32::from_rgb(0x99, 0xd6, 0xff);
-pub const RED: Color32 = Color32::from_rgb(0xfb, 0x86, 0x86);
-/// 玻璃面板底色（半透明，让背后的亚克力模糊透出）。
-pub const GLASS: Color32 = Color32::from_rgba_unmultiplied_const(12, 22, 17, 208);
-pub const PANEL: Color32 = Color32::from_rgba_unmultiplied_const(22, 38, 30, 150);
-pub const TEXT: Color32 = Color32::from_rgb(0xee, 0xf3, 0xea);
-pub const TEXT_DIM: Color32 = Color32::from_rgb(0xa5, 0xbe, 0x9e);
-/// 细边框（亮色，仿 DeltaMelody 的 rgba(220,239,223,0.15)）。
-pub const LINE: Color32 = Color32::from_rgba_unmultiplied_const(220, 239, 223, 38);
-/// 卡片底色（半透明白，叠加在玻璃上形成层次）。
-pub const CARD: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 10);
-/// 标题栏底色（半透明深色条）。
-pub const TITLEBAR: Color32 = Color32::from_rgba_unmultiplied_const(14, 24, 19, 200);
+// ---- 核心强调色 ----
+pub const MINT: Color32 = Color32::from_rgb(0x4a, 0xde, 0x80);        // 活力薄荷绿 #4ade80
+#[allow(dead_code)]
+pub const MINT_GLOW: Color32 = Color32::from_rgba_unmultiplied_const(74, 222, 128, 45);
+pub const CYAN: Color32 = Color32::from_rgb(0x38, 0xbd, 0xf8);        // 青空蓝 #38bdf8
+pub const AMBER: Color32 = Color32::from_rgb(0xfb, 0xbf, 0x24);       // 琥珀黄 #fbbf24
+pub const BLUE: Color32 = Color32::from_rgb(0x81, 0x8c, 0xf8);        // 靛蓝 #818cf8
+pub const RED: Color32 = Color32::from_rgb(0xf8, 0x71, 0x71);         // 珊瑚红 #f87171
+
+// ---- 背景与表面层次 ----
+pub const GLASS: Color32 = Color32::from_rgba_unmultiplied_const(12, 18, 15, 230); // 亚克力主背景
+pub const TITLEBAR: Color32 = Color32::from_rgba_unmultiplied_const(16, 24, 20, 240);
+pub const CARD: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 8);   // 卡片轻微白透明
+#[allow(dead_code)]
+pub const CARD_ELEVATED: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 14);
+pub const PANEL: Color32 = Color32::from_rgba_unmultiplied_const(20, 32, 26, 180);
+
+// ---- 文本色阶 ----
+pub const TEXT: Color32 = Color32::from_rgb(0xf3, 0xf4, 0xf6);        // 主文本 #f3f4f6
+pub const TEXT_DIM: Color32 = Color32::from_rgb(0x9c, 0xa3, 0xaf);    // 次级文本 #9ca3af
+pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x64, 0x74, 0x8b);  // 弱化文本 #64748b
+
+// ---- 边框与线段 ----
+pub const LINE: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 22);
+pub const LINE_LIGHT: Color32 = Color32::from_rgba_unmultiplied_const(255, 255, 255, 45);
 
 /// 加载中文字体并应用深色主题。
 pub fn apply(ctx: &egui::Context) {
@@ -31,36 +38,44 @@ pub fn apply(ctx: &egui::Context) {
     v.panel_fill = GLASS;
     v.window_fill = GLASS;
     v.extreme_bg_color = PANEL;
-    v.faint_bg_color = Color32::from_rgb(22, 34, 29);
-    v.code_bg_color = Color32::from_rgb(18, 26, 23);
+    v.faint_bg_color = Color32::from_rgb(18, 28, 23);
+    v.code_bg_color = Color32::from_rgb(15, 22, 19);
     v.window_stroke = Stroke::new(1.0, LINE);
-    v.selection.bg_fill = Color32::from_rgb(0x44, 0x6b, 0x52);
+    v.selection.bg_fill = Color32::from_rgba_unmultiplied_const(74, 222, 128, 60);
     v.selection.stroke = Stroke::NONE;
     v.hyperlink_color = CYAN;
 
-    let inactive = Color32::from_rgb(30, 46, 38);
-    let hovered = Color32::from_rgb(38, 58, 48);
-    let active = Color32::from_rgb(46, 68, 56);
+    let inactive = Color32::from_rgba_unmultiplied_const(255, 255, 255, 10);
+    let hovered = Color32::from_rgba_unmultiplied_const(255, 255, 255, 20);
+    let active = Color32::from_rgba_unmultiplied_const(74, 222, 128, 40);
+
     v.widgets.inactive.bg_fill = inactive;
     v.widgets.inactive.weak_bg_fill = inactive;
     v.widgets.inactive.bg_stroke = Stroke::new(1.0, LINE);
     v.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_DIM);
+    v.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
+
     v.widgets.hovered.bg_fill = hovered;
     v.widgets.hovered.weak_bg_fill = hovered;
     v.widgets.hovered.bg_stroke = Stroke::new(1.0, MINT);
     v.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT);
+    v.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
+
     v.widgets.active.bg_fill = active;
     v.widgets.active.weak_bg_fill = active;
     v.widgets.active.bg_stroke = Stroke::new(1.0, MINT);
     v.widgets.active.fg_stroke = Stroke::new(1.0, TEXT);
+    v.widgets.active.corner_radius = egui::CornerRadius::same(6);
+
     ctx.set_theme(egui::Theme::Dark);
     ctx.set_visuals(v);
 
     ctx.global_style_mut(|style| {
-        style.text_styles.insert(TextStyle::Body, FontId::new(14.0, FontFamily::Proportional));
-        style.text_styles.insert(TextStyle::Small, FontId::new(12.0, FontFamily::Proportional));
-        style.text_styles.insert(TextStyle::Heading, FontId::new(18.0, FontFamily::Proportional));
-        style.text_styles.insert(TextStyle::Button, FontId::new(14.0, FontFamily::Proportional));
+        style.text_styles.insert(TextStyle::Body, FontId::new(13.5, FontFamily::Proportional));
+        style.text_styles.insert(TextStyle::Small, FontId::new(11.5, FontFamily::Proportional));
+        style.text_styles.insert(TextStyle::Heading, FontId::new(17.0, FontFamily::Proportional));
+        style.text_styles.insert(TextStyle::Button, FontId::new(13.5, FontFamily::Proportional));
+        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
     });
 }
 
@@ -69,8 +84,7 @@ fn setup_fonts(ctx: &egui::Context) {
     use std::sync::Arc;
 
     let mut fonts = egui::FontDefinitions::default();
-    // 优先单个 TTF（DengXian），再回退到微软雅黑 / 黑体 / 宋体。
-    let candidates = ["Deng.ttf", "msyh.ttc", "simhei.ttf", "simsun.ttc"];
+    let candidates = ["msyh.ttc", "Deng.ttf", "simhei.ttf", "simsun.ttc"];
     let dir = std::path::Path::new("C:\\Windows\\Fonts");
     for name in candidates {
         let path = dir.join(name);
@@ -91,9 +105,6 @@ fn setup_fonts(ctx: &egui::Context) {
 }
 
 /// 对无边框窗口应用 Windows 亚克力背景与 DWM 圆角。
-///
-/// - Win11：`DWMSBT_TRANSIENTWINDOW`（亚克力，自动模糊窗口背后内容）。
-/// - Win10：调用会静默失败，此时仍由半透明玻璃底色兜底。
 #[cfg(windows)]
 pub fn apply_backdrop(hwnd: isize) {
     use windows_sys::Win32::{
@@ -113,8 +124,7 @@ pub fn apply_backdrop(hwnd: isize) {
             &backdrop as *const i32 as *const _,
             std::mem::size_of::<i32>() as u32,
         );
-        // DWMWCP_ROUND = 2
-        let corner: i32 = 2;
+        let corner: i32 = 2; // DWMWCP_ROUND
         let _ = DwmSetWindowAttribute(
             hwnd,
             DWMWA_WINDOW_CORNER_PREFERENCE as u32,
@@ -124,6 +134,5 @@ pub fn apply_backdrop(hwnd: isize) {
     }
 }
 
-/// 非 Windows 平台的空实现（保持接口一致）。
 #[cfg(not(windows))]
 pub fn apply_backdrop(_hwnd: isize) {}

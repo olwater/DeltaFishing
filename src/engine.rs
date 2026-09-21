@@ -1,12 +1,13 @@
 //! 钓鱼状态机与后台引擎线程。
 //!
-//! 流程（台钓 · 鼠标左键）：抛竿 → 等待入水 → 听咬钩声 → 刺鱼(左键) → 收竿动画 → 重复。
+//! 流程（台钓 · 鼠标左键）：
+//! 抛竿 → 等待入水 → 听咬钩声(立体声三层判据+右键聚焦) → 刺鱼(左键) → 跳过收竿动画/切刀重置 → 重复。
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::audio::{self, Detector, LoopbackCapture, Template};
+use crate::audio::{self, DetectionResult, Detector, LoopbackCapture, StereoFrame, Template};
 use crate::config::Config;
 use crate::game::is_game_in_foreground;
 use crate::input::{self, Hotkey, Hotkeys, RightHold};
@@ -53,6 +54,8 @@ pub struct Shared {
     pub state: State,
     pub stats: Stats,
     pub last_sim: f32,
+    pub last_level_db: f32,
+    pub last_pan_db: f32,
     pub audio_level: f32,
     pub game_focused: bool,
     pub foreground_exe: String,
@@ -69,6 +72,8 @@ impl Shared {
             state: State::Stopped,
             stats: Stats::default(),
             last_sim: 0.0,
+            last_level_db: -99.0,
+            last_pan_db: 0.0,
             audio_level: 0.0,
             game_focused: false,
             foreground_exe: String::new(),
@@ -83,10 +88,14 @@ struct Machine {
     state: State,
     stats: Stats,
     deadline: Option<Instant>,
-    /// 本轮等待咬钩期间的相似度峰值（超时日志用，帮助判断阈值）。
+    /// 本轮等待咬钩期间的相似度峰值。
     peak_sim: f32,
     /// 上次输出「游戏不在前台」提示的时间（避免刷屏）。
     last_unfocused_log: Option<Instant>,
+    /// 拦截日志冷却时间戳（避免短时间内刷屏报同一个拦截）。
+    last_reject_log: Option<Instant>,
+    /// 本次收竿是否已经执行过跳过动画点击。
+    anim_skipped: bool,
 }
 
 impl Machine {
@@ -97,6 +106,8 @@ impl Machine {
             deadline: None,
             peak_sim: 0.0,
             last_unfocused_log: None,
+            last_reject_log: None,
+            anim_skipped: false,
         }
     }
 
@@ -104,18 +115,17 @@ impl Machine {
         *self = Self::new();
     }
 
-    /// 执行一拍状态机（不阻塞，阻塞仅发生在点击的极短 hold 内）。
+    /// 执行一拍状态机。
     fn step(
         &mut self,
         focused: bool,
-        sim: f32,
+        det: DetectionResult,
         cfg: &Config,
         right: &mut RightHold,
         logs: &mut Vec<(Level, String)>,
     ) {
         if !focused {
             right.ensure_up();
-            // 游戏不在前台：静默不动会让用户以为死了，每 3 秒提示一次原因。
             let now = Instant::now();
             let should_log = self
                 .last_unfocused_log
@@ -135,65 +145,156 @@ impl Machine {
         let now = Instant::now();
         match self.state {
             State::Idle => {
-                if !self.do_cast(cfg, logs) { self.state = State::Stopped; return; }
+                if !self.do_cast(cfg, logs) {
+                    self.state = State::Stopped;
+                    return;
+                }
                 self.state = State::Casting;
                 self.deadline = Some(now + Duration::from_secs_f64(cfg.cast_delay));
             }
             State::Casting => {
                 if self.deadline_is_due() {
                     self.state = State::WaitingBite;
-                    // 进入等待咬钩阶段才启动本阶段的超时计时（此前是抛竿等待）。
                     self.deadline = Some(Instant::now() + Duration::from_secs_f64(cfg.round_timeout));
                     self.peak_sim = 0.0;
+                    self.anim_skipped = false;
                     logs.push((Level::Info, "等待咬钩…".to_string()));
                 }
             }
-            State::WaitingBite => { if cfg.hold_rmb {
+            State::WaitingBite => {
+                if cfg.hold_rmb {
                     right.ensure_down();
                 } else {
                     right.ensure_up();
                 }
-                self.peak_sim = self.peak_sim.max(sim);
+                self.peak_sim = self.peak_sim.max(det.sim);
+
                 let thr = cfg.bite_threshold / 100.0;
-                if sim >= thr {
-                    right.ensure_up();
-                    self.stats.bites += 1;
-                    logs.push((
-                        Level::Ok,
-                        format!("检测到咬钩 (相似度 {:.0}%)", sim * 100.0),
-                    ));
-                    self.state = State::Striking;
-                    self.deadline = Some(now + Duration::from_secs_f64(cfg.strike_delay));
+                let sim_ok = det.sim >= thr;
+                let level_ok = det.level_db >= cfg.level_min_db
+                    && (cfg.level_max_db == 0.0 || det.level_db <= cfg.level_max_db);
+                let pan_ok = det.pan_db.abs() <= cfg.pan_max_db;
+
+                if sim_ok {
+                    if !level_ok || !pan_ok {
+                        // 命中咬钩特征但未通过归属判据，拦截并防刷屏记录
+                        let can_log = self
+                            .last_reject_log
+                            .map(|t| now.duration_since(t) >= Duration::from_millis(800))
+                            .unwrap_or(true);
+                        if can_log {
+                            self.last_reject_log = Some(now);
+                            if !level_ok {
+                                if det.level_db < cfg.level_min_db {
+                                    logs.push((
+                                        Level::Warn,
+                                        format!(
+                                            "拦截远处咬钩: 电平 {:.1}dB < 门限 {:.1}dB (相似度 {:.0}%)",
+                                            det.level_db, cfg.level_min_db, det.sim * 100.0
+                                        ),
+                                    ));
+                                } else {
+                                    logs.push((
+                                        Level::Warn,
+                                        format!(
+                                            "拦截爆音/枪炮: 电平 {:.1}dB > 门限 {:.1}dB (相似度 {:.0}%)",
+                                            det.level_db, cfg.level_max_db, det.sim * 100.0
+                                        ),
+                                    ));
+                                }
+                            } else if !pan_ok {
+                                let side = if det.pan_db > 0.0 { "左侧" } else { "右侧" };
+                                logs.push((
+                                    Level::Warn,
+                                    format!(
+                                        "拦截他人咬钩({}): 声像差 {:+.1}dB 偏离正前方 (门限 ±{:.1}dB · 相似度 {:.0}%)",
+                                        side, det.pan_db, cfg.pan_max_db, det.sim * 100.0
+                                    ),
+                                ));
+                            }
+                        }
+                    } else {
+                        // 三道闸门全部通过：确认为自己的鱼！
+                        right.ensure_up();
+                        self.stats.bites += 1;
+                        logs.push((
+                            Level::Ok,
+                            format!(
+                                "检测到咬钩！(相似度 {:.0}% · 电平 {:.1}dB · 声像 {:+.1}dB)",
+                                det.sim * 100.0,
+                                det.level_db,
+                                det.pan_db
+                            ),
+                        ));
+                        self.state = State::Striking;
+                        self.deadline = Some(now + Duration::from_secs_f64(cfg.strike_delay));
+                    }
                 } else if self.deadline_is_due() {
+                    // 单轮超时未咬钩
                     right.ensure_up();
                     self.stats.misses += 1;
                     logs.push((
                         Level::Warn,
                         format!(
-                            "单轮 {:.0}s 未咬钩，收竿重抛 (第 {} 次) · 本轮相似度峰值 {:.0}%（阈值 {:.0}%）",
+                            "单轮 {:.0}s 未咬钩，收竿重抛 (第 {} 次) · 峰值相似度 {:.0}%",
                             cfg.round_timeout,
                             self.stats.misses,
-                            self.peak_sim * 100.0,
-                            cfg.bite_threshold
+                            self.peak_sim * 100.0
                         ),
                     ));
-                    if !do_click(cfg, logs) { self.state = State::Stopped; return; }
-                    self.state = State::Reeling;
-                    self.deadline = Some(now + Duration::from_secs_f64(self.random_reel_wait(cfg)));
+
+                    if cfg.reset_on_timeout {
+                        logs.push((Level::Info, "执行 3→6 切刀切竿强制重置状态".to_string()));
+                        input::reset_fishing_stance();
+                        self.state = State::Idle;
+                    } else {
+                        if !do_click(cfg, logs) {
+                            self.state = State::Stopped;
+                            return;
+                        }
+                        self.state = State::Reeling;
+                        self.anim_skipped = true; // 超时收竿没有展示鱼动画
+                        self.deadline = Some(now + Duration::from_secs_f64(self.random_reel_wait(cfg)));
+                    }
                 }
             }
             State::Striking => {
                 if self.deadline_is_due() {
-                    if !do_click(cfg, logs) { self.state = State::Stopped; return; }
+                    if !do_click(cfg, logs) {
+                        self.state = State::Stopped;
+                        return;
+                    }
                     self.stats.catches += 1;
-                    logs.push((Level::Ok, format!("已发送刺鱼点击，累计 {} 次（实际结果以游戏为准）", self.stats.catches)));
+                    logs.push((
+                        Level::Ok,
+                        format!("已发送刺鱼点击，累计 {} 次", self.stats.catches),
+                    ));
                     self.state = State::Reeling;
-                    self.deadline = Some(now + Duration::from_secs_f64(self.random_reel_wait(cfg)));
+                    if cfg.skip_anim {
+                        self.anim_skipped = false;
+                        self.deadline = Some(now + Duration::from_secs_f64(cfg.skip_anim_delay));
+                    } else {
+                        self.anim_skipped = true;
+                        self.deadline = Some(now + Duration::from_secs_f64(self.random_reel_wait(cfg)));
+                    }
                 }
             }
             State::Reeling => {
                 if self.deadline_is_due() {
-                    self.state = State::Idle;
+                    if cfg.skip_anim && !self.anim_skipped {
+                        // 刺鱼后第一次到期：轻点左键打断展示鱼动画
+                        self.anim_skipped = true;
+                        if !do_click(cfg, logs) {
+                            self.state = State::Stopped;
+                            return;
+                        }
+                        logs.push((Level::Info, "已点击打断展示鱼动画，提速收竿".to_string()));
+                        let wait = self.random_post_skip_wait(cfg);
+                        self.deadline = Some(now + Duration::from_secs_f64(wait));
+                    } else {
+                        // 收竿动画全部结束，进入下一轮
+                        self.state = State::Idle;
+                    }
                 }
             }
             State::Stopped => {}
@@ -210,29 +311,46 @@ impl Machine {
         lo + fastrand::f64() * (hi - lo)
     }
 
+    fn random_post_skip_wait(&self, cfg: &Config) -> f64 {
+        let lo = cfg.post_skip_wait_min;
+        let hi = cfg.post_skip_wait_max.max(lo);
+        lo + fastrand::f64() * (hi - lo)
+    }
+
     fn do_cast(&mut self, cfg: &Config, logs: &mut Vec<(Level, String)>) -> bool {
-        if !do_click(cfg, logs) { return false; }
-        if cfg.double_cast && !do_click(cfg, logs) { return false; }
+        if !do_click(cfg, logs) {
+            return false;
+        }
+        if cfg.double_cast && !do_click(cfg, logs) {
+            return false;
+        }
         self.stats.casts += 1;
         logs.push((Level::Info, format!("抛竿 #{}", self.stats.casts)));
         true
     }
 }
-
+
 fn do_click(cfg: &Config, _logs: &mut Vec<(Level, String)>) -> bool {
     input::left_click(cfg.click_hold);
     true
 }
 
-fn rms(samples: &[f32]) -> f32 {
+fn rms_stereo(samples: &[StereoFrame]) -> f32 {
     if samples.is_empty() {
         return 0.0;
     }
-    let mean_sq = samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32;
+    let mean_sq: f32 = samples
+        .iter()
+        .map(|s| {
+            let m = s.mono();
+            m * m
+        })
+        .sum::<f32>()
+        / samples.len() as f32;
     mean_sq.sqrt()
 }
 
-/// 启动后台引擎线程。该线程常驻，仅在 `running` 为真时驱动状态机。
+/// 启动后台引擎线程。
 pub fn spawn(shared: Arc<Mutex<Shared>>) {
     std::thread::Builder::new()
         .name("fishing-engine".into())
@@ -243,20 +361,19 @@ pub fn spawn(shared: Arc<Mutex<Shared>>) {
 fn worker_loop(shared: Arc<Mutex<Shared>>) {
     let mut hotkeys = Hotkeys::default();
     let mut right = RightHold::default();
-    let audio_buffer: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let audio_buffer: Arc<Mutex<VecDeque<StereoFrame>>> = Arc::new(Mutex::new(VecDeque::new()));
     let mut capture: Option<LoopbackCapture> = None;
     let mut detector: Option<Detector> = None;
     let mut machine = Machine::new();
 
-    // 固定使用内嵌咬钩音模板（与游戏内音效同源，用户实测可靠）。
+    // 固定使用内嵌咬钩音模板（0.35s 瞬态核心）。
     let template = Template::from_bytes(BITE_WAV, audio::TEMPLATE_LEN)
         .expect("内嵌咬钩模板加载失败");
 
-    // 首次启动日志
     if let Ok(mut s) = shared.lock() {
         let device_count = s.devices.len();
         s.log.info(format!(
-            "三角洲行动 · 自动钓鱼  共发现 {device_count} 个音频设备 · 内置咬钩音模板"
+            "三角洲行动 · 自动钓鱼  共发现 {device_count} 个音频设备 · 立体声声学三层判据已就绪"
         ));
     }
 
@@ -275,15 +392,9 @@ fn worker_loop(shared: Arc<Mutex<Shared>>) {
                     if let Ok(mut s) = shared.lock() {
                         s.stats = Stats::default();
                         s.last_sim = 0.0;
+                        s.last_level_db = -99.0;
+                        s.last_pan_db = 0.0;
                         s.state = State::Idle;
-                        let dev = if cfg.device_name.is_empty() {
-                            "默认输出".to_string()
-                        } else {
-                            cfg.device_name.clone()
-                        };
-                        if false {
-                            s.log.ok(format!("开始运行，音频设备：{dev}"));
-                        }
                     }
                 }
                 Err(e) => {
@@ -339,35 +450,39 @@ fn worker_loop(shared: Arc<Mutex<Shared>>) {
             continue;
         }
 
-        // ---- 采集音频并喂给检测器 ----
-        let mut samples: Vec<f32> = Vec::new();
+        // ---- 采集立体声音频并喂给检测器 ----
+        let mut samples: Vec<StereoFrame> = Vec::new();
         if let Ok(mut q) = audio_buffer.lock() {
             samples.extend(q.drain(..));
         }
-        let level = rms(&samples);
-        let sim = match detector.as_mut() {
+        let level = rms_stereo(&samples);
+        let det_res = match detector.as_mut() {
             Some(det) if !samples.is_empty() => det.push(&samples),
-            Some(det) => det.last_sim(),
-            None => 0.0,
+            Some(det) => det.last_result(),
+            None => DetectionResult::default(),
         };
 
-        // ---- 前台检测（后台模式跳过：点击通过窗口消息投递，与前台无关） ----
+        // ---- 前台检测 ----
         let focused = is_game_in_foreground(&cfg.game_exe);
         let fg_exe = crate::game::foreground_exe().unwrap_or_default();
 
         // ---- 状态机 ----
         let mut logs: Vec<(Level, String)> = Vec::new();
-        machine.step(focused, sim, &cfg, &mut right, &mut logs);
+        machine.step(focused, det_res, &cfg, &mut right, &mut logs);
 
         // ---- 写回共享状态 ----
         if let Ok(mut s) = shared.lock() {
-            s.last_sim = sim;
+            s.last_sim = det_res.sim;
+            s.last_level_db = det_res.level_db;
+            s.last_pan_db = det_res.pan_db;
             s.audio_level = level;
             s.game_focused = focused;
             s.foreground_exe = fg_exe;
             s.state = if s.paused { State::Stopped } else { machine.state };
             s.stats = machine.stats;
-            if machine.state == State::Stopped { s.running = false; }
+            if machine.state == State::Stopped {
+                s.running = false;
+            }
             for (lvl, txt) in logs {
                 s.log.push(lvl, txt);
             }
@@ -376,5 +491,3 @@ fn worker_loop(shared: Arc<Mutex<Shared>>) {
         std::thread::sleep(Duration::from_millis(15));
     }
 }
-
-
